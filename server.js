@@ -1,193 +1,165 @@
-// server.js
-// .env を必ず一番最初に読む
+// server.js  — Node 20/22 OK（ESM）
+// ① .env を最初に読む
 import 'dotenv/config';
 
 import express from 'express';
 import Stripe from 'stripe';
+import cors from 'cors';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ───────────────────────────────
-// WooCommerce REST helpers
-// ───────────────────────────────
+// ② Stripe
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// ③ WooCommerce REST helpers（Basic 認証で呼ぶ）
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`${name} is required`);
   return v;
 }
-const WC_BASE_URL = mustEnv('WC_BASE_URL');               // 例: https://lovework.jp
-const WC_CK       = mustEnv('WC_CONSUMER_KEY');           // Woo API Key (Read/Write)
-const WC_CS       = mustEnv('WC_CONSUMER_SECRET');
+const WC_BASE   = mustEnv('WC_BASE_URL').replace(/\/$/, '');
+const WC_CK     = mustEnv('WC_CONSUMER_KEY');
+const WC_CS     = mustEnv('WC_CONSUMER_SECRET');
 
-function wcUrl(path) {
-  const u = new URL(`${WC_BASE_URL.replace(/\/$/, '')}/wp-json/wc/v3${path}`);
-  u.searchParams.set('consumer_key', WC_CK);
-  u.searchParams.set('consumer_secret', WC_CS);
-  return u.toString();
+async function wcFetch(path, init = {}) {
+  const url = `${WC_BASE}/wp-json/wc/v3${path}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    // Basic 認証に切り替え（WAFに弾かれにくい）
+    'Authorization': 'Basic ' + Buffer.from(`${WC_CK}:${WC_CS}`).toString('base64'),
+    'User-Agent': 'lovework-checkout/1.0 (+https://lovework.jp)',
+    ...(init.headers || {}),
+  };
+  const res = await fetch(url, { ...init, headers });
+  return res;
 }
-
 async function wcGetOrder(orderId) {
-  const r = await fetch(wcUrl(`/orders/${orderId}`));
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Woo GET ${orderId} failed: ${r.status} ${t.slice(0,400)}`);
-  }
+  const r = await wcFetch(`/orders/${orderId}`);
+  if (!r.ok) throw new Error(`Woo GET ${orderId} failed: ${r.status} ${await r.text()}`);
   return r.json();
 }
-
 async function wcUpdateOrderStatus(orderId, status) {
-  const r = await fetch(wcUrl(`/orders/${orderId}`), {
+  const r = await wcFetch(`/orders/${orderId}`, {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ status }),
   });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`Woo PUT ${orderId} failed: ${r.status} ${t.slice(0,400)}`);
-  }
+  if (!r.ok) throw new Error(`Woo PUT ${orderId} failed: ${r.status} ${await r.text()}`);
   return r.json();
 }
 
-// ───────────────────────────────
-// Stripe SDK（Webhook検証にも使う）
-// ───────────────────────────────
-const stripe = new Stripe(mustEnv('STRIPE_SECRET_KEY'));
+// ④ Webhook（**raw** で最初に置く）
+app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const sig = req.headers['stripe-signature'];
+    const event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
 
-// 1) Webhook（raw で最初に登録するのが超重要）
-app.post(
-  '/webhooks/stripe',
-  express.raw({ type: 'application/json' }),
-  async (req, res) => {
-    try {
-      const sig = req.headers['stripe-signature'];
-      const event = stripe.webhooks.constructEvent(
-        req.body,
-        sig,
-        mustEnv('STRIPE_WEBHOOK_SECRET')
-      );
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const s = event.data.object;               // Stripe Checkout Session
+        const orderId = parseInt(s.client_reference_id, 10);
 
-      switch (event.type) {
-        case 'checkout.session.completed': {
-          const session = event.data.object;
-          const orderId = parseInt(session.client_reference_id, 10);
+        // ガード
+        if (!orderId || s.mode !== 'payment' || s.payment_status !== 'paid') break;
 
-          // 念のためのガード
-          if (!orderId) break;
-          if (session.mode !== 'payment') break;
-          if (session.payment_status !== 'paid') break;
-
-          // Woo を processing に更新（すでに processing/completed なら何もしない）
-          try {
-            const cur = await wcGetOrder(orderId);
-            const s = String(cur.status || '');
-            if (s !== 'processing' && s !== 'completed') {
-              await wcUpdateOrderStatus(orderId, 'processing');
-              console.log(`[Webhook] order ${orderId} -> processing`);
-            } else {
-              console.log(`[Webhook] order ${orderId} already ${s}`);
-            }
-          } catch (e) {
-            // 401 の場合は CK/CS or WAF/ベーシック認証が原因のことが多い
-            console.error('[Webhook Error] Woo update failed:', e.message);
-            // Stripe は 2xx 以外だとリトライしてくれる。Woo 側一時不調なら 500 を返して再試行させるのも手。
-            return res.status(500).send('Woo update failed');
+        // すでに処理中/完了なら何もしない（冪等）
+        try {
+          const current = await wcGetOrder(orderId);
+          const cur = String(current.status || '');
+          if (cur === 'processing' || cur === 'completed') {
+            console.log(`[Webhook] Woo order ${orderId} already ${cur}`);
+          } else {
+            await wcUpdateOrderStatus(orderId, 'processing');
+            console.log(`[Webhook] Woo order ${orderId} -> processing`);
           }
-          break;
+        } catch (e) {
+          console.error('[Webhook Error] Woo update failed:', e.message);
         }
-
-        case 'checkout.session.expired': {
-          const s = event.data.object;
-          console.log('[Webhook] expired order:', s.client_reference_id);
-          break;
-        }
-
-        default:
-          break;
+        break;
       }
-
-      res.json({ received: true });
-    } catch (err) {
-      console.error('[Webhook Error]', err.message);
-      res.status(400).send(`Webhook Error: ${err.message}`);
+      case 'checkout.session.expired': {
+        const s = event.data.object;
+        console.log('[Webhook] expired order:', s.client_reference_id);
+        break;
+      }
+      default:
+        break;
     }
+    res.json({ received: true });
+  } catch (err) {
+    console.error('[Webhook Error]', err.message);
+    res.status(400).send(`Webhook Error: ${err.message}`);
   }
-);
+});
 
-// 2) ここから下は JSON でOK（Webhookより下に置く）
+// ⑤ それ以外は JSON でOK（Webhook より下に置く）
+app.use(cors({ origin: ['https://lovework.jp'] }));
 app.use(express.json());
 
 app.get('/health', (_req, res) => res.send('ok'));
 
-// 3) 注文直後に WP → Render が叩くエンドポイント（リダイレクト先の Stripe URL を作る）
+// チェックアウト URL を作る（WP から叩く想定）
 app.post('/api/create-checkout', async (req, res) => {
   try {
-    // 内部APIキーで保護（mu-plugin から X-API-KEY を付与）
-    const apiKey = req.header('X-API-KEY');
-    if (!apiKey || apiKey !== mustEnv('INTERNAL_API_KEY')) {
-      return res.status(401).json({ ok:false, error:'UNAUTHORIZED' });
+    if (req.headers['x-api-key'] !== process.env.INTERNAL_API_KEY) {
+      return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
     }
 
     const { orderId, amountJpy } = req.body || {};
-    if (!Number.isInteger(orderId) || orderId <= 0) {
-      return res.status(400).json({ ok:false, error:'INVALID_ORDER_ID' });
-    }
-    if (!Number.isInteger(amountJpy) || amountJpy <= 0) {
-      return res.status(400).json({ ok:false, error:'INVALID_AMOUNT_JPY_INTEGER_REQUIRED' });
+    const oid = parseInt(orderId, 10);
+    const amt = parseInt(amountJpy, 10);
+    if (!oid || !Number.isInteger(amt) || amt <= 0) {
+      return res.status(400).json({ ok: false, error: 'BAD_INPUT' });
     }
 
     const appBase = mustEnv('APP_BASE_URL');
-
     const params = {
       mode: 'payment',
       line_items: [{
         price_data: {
           currency: 'jpy',
-          product_data: { name: `Order #${orderId}` },
-          unit_amount: amountJpy,
+          product_data: { name: `Order #${oid}` },
+          unit_amount: amt,
         },
         quantity: 1,
       }],
-      success_url: `${appBase}/payment/success?order=${encodeURIComponent(orderId)}&cs={CHECKOUT_SESSION_ID}`,
-      cancel_url:  `${appBase}/payment/cancel?order=${encodeURIComponent(orderId)}`,
-      client_reference_id: String(orderId),
-      // 24h 有効
-      expires_at: Math.floor(Date.now()/1000) + 60*60*24
+      success_url: `${appBase}/payment/success?order=${encodeURIComponent(oid)}&cs={CHECKOUT_SESSION_ID}`,
+      cancel_url:  `${appBase}/payment/cancel?order=${encodeURIComponent(oid)}`,
+      client_reference_id: String(oid),
+      // 任意: 24h で期限
+      expires_at: Math.floor(Date.now()/1000) + 60*60*24,
     };
 
-    // idempotency: 同一 orderId では 1 セッションだけ（何回叩かれても同一判定）
     const session = await stripe.checkout.sessions.create(params, {
-      idempotencyKey: `order-${orderId}`,
+      idempotencyKey: `order-${oid}`, // 冪等
     });
 
-    res.json({ ok:true, url: session.url, sessionId: session.id });
+    res.json({ ok: true, url: session.url, sessionId: session.id });
   } catch (e) {
     console.error('[create-checkout] error', e);
-    res.status(400).json({ ok:false, error:e.message || 'FAILED' });
+    res.status(500).json({ ok: false, error: e.message || 'FAILED' });
   }
 });
 
-// （任意）成功ページから決済ステータスを照会したい場合
+// 任意：成功ページから照会
 app.get('/api/checkout-status', async (req, res) => {
   try {
     const { cs } = req.query;
     if (!cs) return res.status(400).json({ ok:false, error:'MISSING_CS' });
 
-    const session = await stripe.checkout.sessions.retrieve(cs, {
-      expand: ['payment_intent'],
-    });
-
+    const s = await stripe.checkout.sessions.retrieve(cs, { expand: ['payment_intent'] });
     res.json({
       ok: true,
-      orderId: session.client_reference_id,
-      amount: session.amount_total,
-      currency: session.currency,
-      payment_status: session.payment_status,
-      status: session.status,
+      orderId: s.client_reference_id,
+      amount: s.amount_total,
+      currency: s.currency,
+      payment_status: s.payment_status,
+      status: s.status,
     });
   } catch (e) {
     console.error('[checkout-status]', e);
-    res.status(400).json({ ok:false, error:e.message });
+    res.status(400).json({ ok:false, error: e.message });
   }
 });
 
